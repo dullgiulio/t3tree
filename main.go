@@ -18,9 +18,10 @@ const (
 
 type mysql struct {
 	db      *sql.DB
-	pages   map[int]int    // uid : pid
-	domains map[int]string // pid : domain
-	roots   []int          // uid of siteroot
+	pages   map[int]int      // uid : pid
+	domains map[int]string   // pid : domain
+	assoc   map[int][]string // pid : associated data
+	roots   []int            // uid of siteroot
 }
 
 func newMysql(dsn string) (*mysql, error) {
@@ -35,6 +36,7 @@ func newMysql(dsn string) (*mysql, error) {
 		db:      db,
 		pages:   make(map[int]int),
 		domains: make(map[int]string),
+		assoc:   make(map[int][]string),
 		roots:   make([]int, 0),
 	}
 	if err := m.loadPages(); err != nil {
@@ -81,7 +83,7 @@ func (m *mysql) loadDomains() error {
 		if err := rows.Scan(&pid, &domain, &forced); err != nil {
 			return fmt.Errorf("cannot read domains row: %v", err)
 		}
-		if _, ok := m.domains[pid]; ok && !forced {
+		if _, ok := m.domains[pid]; ok { // && !forced {
 			continue
 		}
 		m.domains[pid] = domain
@@ -89,17 +91,32 @@ func (m *mysql) loadDomains() error {
 	return nil
 }
 
-func (m *mysql) query(sql string) ([]int, error) {
+func (m *mysql) query(sql string, nassoc int) ([]int, error) {
 	rows, err := m.db.Query(sql)
 	if err != nil {
 		return nil, err
 	}
 	uids := make([]int, 0)
+	assoc := make([]*string, nassoc)
+	for i := 0; i < nassoc; i++ {
+		b := ""
+		assoc[i] = &b
+	}
+	params := make([]interface{}, nassoc+1)
 	for rows.Next() {
 		var uid int
-		if err := rows.Scan(&uid); err != nil {
+		params[0] = &uid
+		for i := 0; i < nassoc; i++ {
+			params[i+1] = interface{}(assoc[i])
+		}
+		if err := rows.Scan(params...); err != nil {
 			return nil, fmt.Errorf("cannot scan query: %v", err)
 		}
+		data := make([]string, nassoc)
+		for i := 0; i < nassoc; i++ {
+			data[i] = *assoc[i]
+		}
+		m.assoc[uid] = data
 		uids = append(uids, uid)
 	}
 	return uids, nil
@@ -163,6 +180,7 @@ func main() {
 	pid := flag.Int("pid", 0, "Page ID")
 	dsn := flag.String("dsn", "", "Database connection string")
 	query := flag.String("query", "", "A select that yield a list of page IDs")
+	nassoc := flag.Int("nfields", 0, "Number of fields selected except page.uid")
 	children := flag.Bool("children", false, "Select children pages")
 	roots := flag.Bool("roots", false, "Select root pages")
 	csv := flag.Bool("csv", false, "Show CSV for pids, for uid IN (...) query")
@@ -187,9 +205,9 @@ func main() {
 		}
 	}
 	if *query != "" {
-		qids, err := m.query(*query)
+		qids, err := m.query(*query, *nassoc)
 		if err != nil {
-			log.Fatal("cannot execute argument query: %v", err)
+			log.Fatalf("cannot execute argument query: %v", err)
 		}
 		if *children {
 			for _, qid := range qids {
@@ -209,15 +227,25 @@ func main() {
 		log.Fatal("no UIDs found")
 	}
 	if *csv {
-		fmt.Printf("%v\n", intsToString(uids, ", "))
+		fmt.Printf("%s\n", intsToString(uids, ", "))
 	} else {
+		fields := make([]string, *nassoc+1)
 		for _, uid := range uids {
 			rid := m.root(uid)
 			domain := m.domain(rid)
 			if domain == "" {
 				continue
 			}
-			fmt.Printf("https://%s/index.php?id=%d\n", domain, uid)
+			if *nassoc > 0 {
+				assoc := m.assoc[uid]
+				fields[0] = fmt.Sprintf("\"https://%s/index.php?id=%d\"", domain, uid)
+				for i := range assoc {
+					fields[i+1] = fmt.Sprintf("\"%s\"", strings.Replace(assoc[i], "\"", "\\\"", -1))
+				}
+				fmt.Printf("%s\n", strings.Join(fields, ","))
+			} else {
+				fmt.Printf("https://%s/index.php?id=%d\n", domain, uid)
+			}
 		}
 	}
 }
